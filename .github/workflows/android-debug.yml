@@ -1,0 +1,103 @@
+name: Build Android Debug APK
+on:
+  push:
+    branches: [build/android-debug-4ef2900]
+permissions:
+  contents: read
+concurrency:
+  group: openminis-android-debug-4ef2900
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: OpenMinis/OpenMinis
+          ref: 4ef29002e88db1e20e462ec2ff46916e8a7dcb45
+          path: source
+          submodules: recursive
+          persist-credentials: false
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version: "1.25.7"
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+      - name: Install Android packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.0.13004108" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/28.0.13004108" >> "$GITHUB_ENV"
+      - name: Verify fixed source
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "4ef29002e88db1e20e462ec2ff46916e8a7dcb45"
+          test "$(git -C deps/proot rev-parse HEAD)" = "8cf13e997cdc9472997aae19df8050c073c9a86c"
+          test "$(git -C deps/ish rev-parse HEAD)" = "3f6384c70eefd1a370f121d3492a5f21f7767df9"
+          cp src/android/app/provider-customization.properties.example src/android/app/provider-customization.properties
+      - name: Pin native build inputs
+        working-directory: source
+        run: |
+          mkdir -p deps/build/proot-android src/android/app/src/main/assets
+          curl -fsSL https://download.samba.org/pub/talloc/talloc-2.4.2.tar.gz -o deps/build/proot-android/talloc-2.4.2.tar.gz
+          echo "85ecf9e465e20f98f9950a52e9a411e14320bc555fa257d87697b7e7a9b1d8a6  deps/build/proot-android/talloc-2.4.2.tar.gz" | sha256sum -c -
+          curl -fsSL https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.3-aarch64.tar.gz -o src/android/app/src/main/assets/alpine-minirootfs.tar.gz
+          echo "ead8a4b37867bd19e7417dd078748e2312c0aea364403d96758d63ea8ff261ea  src/android/app/src/main/assets/alpine-minirootfs.tar.gz" | sha256sum -c -
+          echo "distributionSha256Sum=f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a76eee151c6" >> src/android/gradle/wrapper/gradle-wrapper.properties
+      - name: Build Android native assets
+        working-directory: source
+        run: |
+          ./deps/build_proot.sh
+          ./scripts/prepare_android_sandbox.sh
+      - name: Build rclone AAR
+        working-directory: source
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20260813181013-1960c775504c
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20260813181013-1960c775504c
+          gomobile init
+          ./deps/build_rclone_android.sh
+          mkdir -p src/android/app/libs
+          cp deps/build/rclone/rclone.aar src/android/app/libs/rclone.aar
+          sha256sum src/android/app/libs/rclone.aar | tee rclone.aar.sha256
+          unzip -Z1 src/android/app/libs/rclone.aar > rclone-entries.txt
+          grep -Fxq "jni/arm64-v8a/libgojni.so" rclone-entries.txt
+      - name: Assemble Debug APK
+        working-directory: source/src/android
+        run: ./gradlew --no-daemon --max-workers=2 :app:assembleDebug
+      - name: Verify APK
+        working-directory: source
+        run: |
+          APK=src/android/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          sha256sum "$APK" | tee app-debug.apk.sha256
+          unzip -t "$APK"
+          unzip -Z1 "$APK" > apk-entries.txt
+          grep -Fxq "assets/proot-aarch64" apk-entries.txt
+          grep -Fxq "assets/alpine-minirootfs.tar.gz" apk-entries.txt
+          grep -Fxq "lib/arm64-v8a/libproot.so" apk-entries.txt
+          grep -Fxq "lib/arm64-v8a/libproot-loader.so" apk-entries.txt
+          grep -Fxq "lib/arm64-v8a/libproot-loader32.so" apk-entries.txt
+          grep -Fxq "lib/arm64-v8a/libgojni.so" apk-entries.txt
+          {
+            echo "source=4ef29002e88db1e20e462ec2ff46916e8a7dcb45"
+            cat rclone.aar.sha256
+            cat app-debug.apk.sha256
+            "$ANDROID_SDK_ROOT/build-tools/36.0.0/aapt" dump badging "$APK" | sed -n '1,8p' 
+            "$ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
+            echo "required_assets=PASS"
+          } | tee build-verification.txt
+          cp "$APK" app-debug.apk
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: OpenMinis-Android-Debug-4ef2900
+          path: |
+            source/app-debug.apk
+            source/app-debug.apk.sha256
+            source/build-verification.txt
+          retention-days: 1
+          if-no-files-found: error
